@@ -165,6 +165,7 @@ public:
     EABIHF,
     Android,
 
+    Spark,
     MSVC,
     Itanium,
     Cygnus,
@@ -456,6 +457,11 @@ public:
   bool isOSMSVCRT() const {
     return isWindowsMSVCEnvironment() || isWindowsGNUEnvironment() ||
            isWindowsItaniumEnvironment();
+  }
+
+  /// \brief Is this a Linux targeting a Apache Spark environment.
+  bool isSparkEnvironment() const {
+    return getOS() == Triple::Linux && getEnvironment() == Triple::Spark;
   }
 
   /// \brief Tests whether the OS is Windows.
