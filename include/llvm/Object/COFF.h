@@ -249,6 +249,15 @@ struct coff_symbol {
 typedef coff_symbol<support::ulittle16_t> coff_symbol16;
 typedef coff_symbol<support::ulittle32_t> coff_symbol32;
 
+// Contains only common parts of coff_symbol16 and coff_symbol32.
+struct coff_symbol_generic {
+  union {
+    char ShortName[COFF::NameSize];
+    StringTableOffset Offset;
+  } Name;
+  support::ulittle32_t Value;
+};
+
 class COFFSymbolRef {
 public:
   COFFSymbolRef(const coff_symbol16 *CS) : CS16(CS), CS32(nullptr) {}
@@ -257,6 +266,12 @@ public:
 
   const void *getRawPtr() const {
     return CS16 ? static_cast<const void *>(CS16) : CS32;
+  }
+
+  const coff_symbol_generic *getGeneric() const {
+    if (CS16)
+      return reinterpret_cast<const coff_symbol_generic *>(CS16);
+    return reinterpret_cast<const coff_symbol_generic *>(CS32);
   }
 
   friend bool operator<(COFFSymbolRef A, COFFSymbolRef B) {
@@ -636,10 +651,10 @@ protected:
                                 StringRef &Res) const override;
   std::error_code getSymbolAddress(DataRefImpl Symb,
                                    uint64_t &Res) const override;
-  uint64_t getSymbolSize(DataRefImpl Symb) const override;
+  uint64_t getSymbolValue(DataRefImpl Symb) const override;
+  uint64_t getCommonSymbolSizeImpl(DataRefImpl Symb) const override;
   uint32_t getSymbolFlags(DataRefImpl Symb) const override;
-  std::error_code getSymbolType(DataRefImpl Symb,
-                                SymbolRef::Type &Res) const override;
+  SymbolRef::Type getSymbolType(DataRefImpl Symb) const override;
   std::error_code getSymbolSection(DataRefImpl Symb,
                                    section_iterator &Res) const override;
   void moveSectionNext(DataRefImpl &Sec) const override;
@@ -661,14 +676,12 @@ protected:
   void moveRelocationNext(DataRefImpl &Rel) const override;
   std::error_code getRelocationAddress(DataRefImpl Rel,
                                        uint64_t &Res) const override;
-  std::error_code getRelocationOffset(DataRefImpl Rel,
-                                      uint64_t &Res) const override;
+  uint64_t getRelocationOffset(DataRefImpl Rel) const override;
   symbol_iterator getRelocationSymbol(DataRefImpl Rel) const override;
-  std::error_code getRelocationType(DataRefImpl Rel,
-                                    uint64_t &Res) const override;
-  std::error_code
-  getRelocationTypeName(DataRefImpl Rel,
-                        SmallVectorImpl<char> &Result) const override;
+  uint64_t getRelocationType(DataRefImpl Rel) const override;
+  void getRelocationTypeName(DataRefImpl Rel,
+                             SmallVectorImpl<char> &Result) const override;
+
 public:
   COFFObjectFile(MemoryBufferRef Object, std::error_code &EC);
   basic_symbol_iterator symbol_begin_impl() const override;
@@ -680,6 +693,8 @@ public:
   COFFSymbolRef getCOFFSymbol(const DataRefImpl &Ref) const;
   COFFSymbolRef getCOFFSymbol(const SymbolRef &Symbol) const;
   const coff_relocation *getCOFFRelocation(const RelocationRef &Reloc) const;
+  unsigned getSectionID(SectionRef Sec) const;
+  unsigned getSymbolSectionID(SymbolRef Sym) const;
 
   uint8_t getBytesInAddress() const override;
   StringRef getFileFormatName() const override;
@@ -743,6 +758,8 @@ public:
     return std::error_code();
   }
   std::error_code getSymbolName(COFFSymbolRef Symbol, StringRef &Res) const;
+  std::error_code getSymbolName(const coff_symbol_generic *Symbol,
+                                StringRef &Res) const;
 
   ArrayRef<uint8_t> getSymbolAuxData(COFFSymbolRef Symbol) const;
 
@@ -753,6 +770,9 @@ public:
       return sizeof(coff_symbol32);
     llvm_unreachable("null symbol table pointer!");
   }
+
+  iterator_range<const coff_relocation *>
+  getRelocations(const coff_section *Sec) const;
 
   std::error_code getSectionName(const coff_section *Sec, StringRef &Res) const;
   uint64_t getSectionSize(const coff_section *Sec) const;

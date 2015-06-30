@@ -55,7 +55,7 @@ public:
     return HeaderBuilder().concat("0x" + Twine::utohexstr(Tag));
   }
 };
-} // namespace
+}
 
 DIBuilder::DIBuilder(Module &m, bool AllowUnresolvedNodes)
     : M(m), VMContext(M.getContext()), TempEnumTypes(nullptr),
@@ -184,6 +184,12 @@ DIImportedEntity *DIBuilder::createImportedModule(DIScope *Context,
                                                   unsigned Line) {
   return ::createImportedModule(VMContext, dwarf::DW_TAG_imported_module,
                                 Context, NS, Line, StringRef(), AllImportedModules);
+}
+
+DIImportedEntity *DIBuilder::createImportedModule(DIScope *Context, DIModule *M,
+                                                  unsigned Line) {
+  return ::createImportedModule(VMContext, dwarf::DW_TAG_imported_module,
+                                Context, M, Line, StringRef(), AllImportedModules);
 }
 
 DIImportedEntity *DIBuilder::createImportedDeclaration(DIScope *Context,
@@ -701,6 +707,14 @@ DINamespace *DIBuilder::createNameSpace(DIScope *Scope, StringRef Name,
                                         DIFile *File, unsigned LineNo) {
   return DINamespace::get(VMContext, getNonCompileUnitScope(Scope), File, Name,
                           LineNo);
+}
+
+DIModule *DIBuilder::createModule(DIScope *Scope, StringRef Name,
+                                  StringRef ConfigurationMacros,
+                                  StringRef IncludePath,
+                                  StringRef ISysRoot) {
+ return DIModule::get(VMContext, getNonCompileUnitScope(Scope), Name,
+                      ConfigurationMacros, IncludePath, ISysRoot);
 }
 
 DILexicalBlockFile *DIBuilder::createLexicalBlockFile(DIScope *Scope,
