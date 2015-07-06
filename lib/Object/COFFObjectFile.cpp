@@ -145,10 +145,13 @@ void COFFObjectFile::moveSymbolNext(DataRefImpl &Ref) const {
   }
 }
 
-std::error_code COFFObjectFile::getSymbolName(DataRefImpl Ref,
-                                              StringRef &Result) const {
+ErrorOr<StringRef> COFFObjectFile::getSymbolName(DataRefImpl Ref) const {
   COFFSymbolRef Symb = getCOFFSymbol(Ref);
-  return getSymbolName(Symb, Result);
+  StringRef Result;
+  std::error_code EC = getSymbolName(Symb, Result);
+  if (EC)
+    return EC;
+  return Result;
 }
 
 uint64_t COFFObjectFile::getSymbolValue(DataRefImpl Ref) const {
@@ -160,21 +163,20 @@ uint64_t COFFObjectFile::getSymbolValue(DataRefImpl Ref) const {
   return Sym.getValue();
 }
 
-std::error_code COFFObjectFile::getSymbolAddress(DataRefImpl Ref,
-                                                 uint64_t &Result) const {
-  Result = getSymbolValue(Ref);
+ErrorOr<uint64_t> COFFObjectFile::getSymbolAddress(DataRefImpl Ref) const {
+  uint64_t Result = getSymbolValue(Ref);
   COFFSymbolRef Symb = getCOFFSymbol(Ref);
   int32_t SectionNumber = Symb.getSectionNumber();
 
   if (Symb.isAnyUndefined() || Symb.isCommon() ||
       COFF::isReservedSectionNumber(SectionNumber))
-    return std::error_code();
+    return Result;
 
   const coff_section *Section = nullptr;
   if (std::error_code EC = getSection(SectionNumber, Section))
     return EC;
   Result += Section->VirtualAddress;
-  return std::error_code();
+  return Result;
 }
 
 SymbolRef::Type COFFObjectFile::getSymbolType(DataRefImpl Ref) const {
@@ -320,14 +322,6 @@ bool COFFObjectFile::isSectionVirtual(DataRefImpl Ref) const {
   // In COFF, a virtual section won't have any in-file 
   // content, so the file pointer to the content will be zero.
   return Sec->PointerToRawData == 0;
-}
-
-bool COFFObjectFile::sectionContainsSymbol(DataRefImpl SecRef,
-                                           DataRefImpl SymbRef) const {
-  const coff_section *Sec = toSec(SecRef);
-  COFFSymbolRef Symb = getCOFFSymbol(SymbRef);
-  int32_t SecNumber = (Sec - SectionTable) + 1;
-  return SecNumber == Symb.getSectionNumber();
 }
 
 static uint32_t getNumberOfRelocations(const coff_section *Sec,
@@ -924,19 +918,15 @@ uint64_t COFFObjectFile::getSectionSize(const coff_section *Sec) const {
   // whether or not we have an executable image.
   //
   // For object files, SizeOfRawData contains the size of section's data;
-  // VirtualSize is always zero.
+  // VirtualSize should be zero but isn't due to buggy COFF writers.
   //
   // For executables, SizeOfRawData *must* be a multiple of FileAlignment; the
   // actual section size is in VirtualSize.  It is possible for VirtualSize to
   // be greater than SizeOfRawData; the contents past that point should be
   // considered to be zero.
-  uint32_t SectionSize;
-  if (Sec->VirtualSize)
-    SectionSize = std::min(Sec->VirtualSize, Sec->SizeOfRawData);
-  else
-    SectionSize = Sec->SizeOfRawData;
-
-  return SectionSize;
+  if (getDOSHeader())
+    return std::min(Sec->VirtualSize, Sec->SizeOfRawData);
+  return Sec->SizeOfRawData;
 }
 
 std::error_code
@@ -966,8 +956,7 @@ void COFFObjectFile::moveRelocationNext(DataRefImpl &Rel) const {
             reinterpret_cast<const coff_relocation*>(Rel.p) + 1);
 }
 
-std::error_code COFFObjectFile::getRelocationAddress(DataRefImpl Rel,
-                                                     uint64_t &Res) const {
+ErrorOr<uint64_t> COFFObjectFile::getRelocationAddress(DataRefImpl Rel) const {
   report_fatal_error("getRelocationAddress not implemented in COFFObjectFile");
 }
 

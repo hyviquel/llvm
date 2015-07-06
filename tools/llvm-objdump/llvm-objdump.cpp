@@ -298,33 +298,30 @@ PrettyPrinter &selectPrettyPrinter(Triple const &Triple) {
 }
 
 template <class ELFT>
-static const typename ELFObjectFile<ELFT>::Elf_Rel *
-getRel(const ELFFile<ELFT> &EF, DataRefImpl Rel) {
-  typedef typename ELFObjectFile<ELFT>::Elf_Rel Elf_Rel;
-  return EF.template getEntry<Elf_Rel>(Rel.d.a, Rel.d.b);
-}
-
-template <class ELFT>
-static const typename ELFObjectFile<ELFT>::Elf_Rela *
-getRela(const ELFFile<ELFT> &EF, DataRefImpl Rela) {
-  typedef typename ELFObjectFile<ELFT>::Elf_Rela Elf_Rela;
-  return EF.template getEntry<Elf_Rela>(Rela.d.a, Rela.d.b);
-}
-
-template <class ELFT>
 static std::error_code getRelocationValueString(const ELFObjectFile<ELFT> *Obj,
                                                 DataRefImpl Rel,
                                                 SmallVectorImpl<char> &Result) {
   typedef typename ELFObjectFile<ELFT>::Elf_Sym Elf_Sym;
   typedef typename ELFObjectFile<ELFT>::Elf_Shdr Elf_Shdr;
+  typedef typename ELFObjectFile<ELFT>::Elf_Rel Elf_Rel;
+  typedef typename ELFObjectFile<ELFT>::Elf_Rela Elf_Rela;
+
   const ELFFile<ELFT> &EF = *Obj->getELFFile();
 
-  const Elf_Shdr *sec = EF.getSection(Rel.d.a);
-  const Elf_Shdr *SymTab = EF.getSection(sec->sh_link);
+  ErrorOr<const Elf_Shdr *> SecOrErr = EF.getSection(Rel.d.a);
+  if (std::error_code EC = SecOrErr.getError())
+    return EC;
+  const Elf_Shdr *Sec = *SecOrErr;
+  ErrorOr<const Elf_Shdr *> SymTabOrErr = EF.getSection(Sec->sh_link);
+  if (std::error_code EC = SymTabOrErr.getError())
+    return EC;
+  const Elf_Shdr *SymTab = *SymTabOrErr;
   assert(SymTab->sh_type == ELF::SHT_SYMTAB ||
          SymTab->sh_type == ELF::SHT_DYNSYM);
-  const Elf_Shdr *StrTabSec = EF.getSection(SymTab->sh_link);
-  ErrorOr<StringRef> StrTabOrErr = EF.getStringTable(StrTabSec);
+  ErrorOr<const Elf_Shdr *> StrTabSec = EF.getSection(SymTab->sh_link);
+  if (std::error_code EC = StrTabSec.getError())
+    return EC;
+  ErrorOr<StringRef> StrTabOrErr = EF.getStringTable(*StrTabSec);
   if (std::error_code EC = StrTabOrErr.getError())
     return EC;
   StringRef StrTab = *StrTabOrErr;
@@ -332,28 +329,32 @@ static std::error_code getRelocationValueString(const ELFObjectFile<ELFT> *Obj,
   StringRef res;
   int64_t addend = 0;
   uint16_t symbol_index = 0;
-  switch (sec->sh_type) {
+  switch (Sec->sh_type) {
   default:
     return object_error::parse_failed;
   case ELF::SHT_REL: {
-    type = getRel(EF, Rel)->getType(EF.isMips64EL());
-    symbol_index = getRel(EF, Rel)->getSymbol(EF.isMips64EL());
+    const Elf_Rel *ERel = Obj->getRel(Rel);
+    type = ERel->getType(EF.isMips64EL());
+    symbol_index = ERel->getSymbol(EF.isMips64EL());
     // TODO: Read implicit addend from section data.
     break;
   }
   case ELF::SHT_RELA: {
-    type = getRela(EF, Rel)->getType(EF.isMips64EL());
-    symbol_index = getRela(EF, Rel)->getSymbol(EF.isMips64EL());
-    addend = getRela(EF, Rel)->r_addend;
+    const Elf_Rela *ERela = Obj->getRela(Rel);
+    type = ERela->getType(EF.isMips64EL());
+    symbol_index = ERela->getSymbol(EF.isMips64EL());
+    addend = ERela->r_addend;
     break;
   }
   }
   const Elf_Sym *symb =
-      EF.template getEntry<Elf_Sym>(sec->sh_link, symbol_index);
+      EF.template getEntry<Elf_Sym>(Sec->sh_link, symbol_index);
   StringRef Target;
-  const Elf_Shdr *SymSec = EF.getSection(symb);
+  ErrorOr<const Elf_Shdr *> SymSec = EF.getSection(symb);
+  if (std::error_code EC = SymSec.getError())
+    return EC;
   if (symb->getType() == ELF::STT_SECTION) {
-    ErrorOr<StringRef> SecName = EF.getSectionName(SymSec);
+    ErrorOr<StringRef> SecName = EF.getSectionName(*SymSec);
     if (std::error_code EC = SecName.getError())
       return EC;
     Target = *SecName;
@@ -432,9 +433,10 @@ static std::error_code getRelocationValueString(const COFFObjectFile *Obj,
                                                 const RelocationRef &Rel,
                                                 SmallVectorImpl<char> &Result) {
   symbol_iterator SymI = Rel.getSymbol();
-  StringRef SymName;
-  if (std::error_code EC = SymI->getName(SymName))
+  ErrorOr<StringRef> SymNameOrErr = SymI->getName();
+  if (std::error_code EC = SymNameOrErr.getError())
     return EC;
+  StringRef SymName = *SymNameOrErr;
   Result.append(SymName.begin(), SymName.end());
   return std::error_code();
 }
@@ -453,16 +455,15 @@ static void printRelocationTargetName(const MachOObjectFile *O,
 
     for (const SymbolRef &Symbol : O->symbols()) {
       std::error_code ec;
-      uint64_t Addr;
-      StringRef Name;
-
-      if ((ec = Symbol.getAddress(Addr)))
+      ErrorOr<uint64_t> Addr = Symbol.getAddress();
+      if ((ec = Addr.getError()))
         report_fatal_error(ec.message());
-      if (Addr != Val)
+      if (*Addr != Val)
         continue;
-      if ((ec = Symbol.getName(Name)))
-        report_fatal_error(ec.message());
-      fmt << Name;
+      ErrorOr<StringRef> Name = Symbol.getName();
+      if (std::error_code EC = Name.getError())
+        report_fatal_error(EC.message());
+      fmt << *Name;
       return;
     }
 
@@ -492,7 +493,9 @@ static void printRelocationTargetName(const MachOObjectFile *O,
   if (isExtern) {
     symbol_iterator SI = O->symbol_begin();
     advance(SI, Val);
-    SI->getName(S);
+    ErrorOr<StringRef> SOrErr = SI->getName();
+    if (!error(SOrErr.getError()))
+      S = *SOrErr;
   } else {
     section_iterator SI = O->section_begin();
     // Adjust for the fact that sections are 1-indexed.
@@ -820,19 +823,20 @@ static void DisassembleObject(const ObjectFile *Obj, bool InlineRelocs) {
     std::vector<std::pair<uint64_t, StringRef>> Symbols;
     for (const SymbolRef &Symbol : Obj->symbols()) {
       if (Section.containsSymbol(Symbol)) {
-        uint64_t Address;
-        if (error(Symbol.getAddress(Address)))
+        ErrorOr<uint64_t> AddressOrErr = Symbol.getAddress();
+        if (error(AddressOrErr.getError()))
           break;
+        uint64_t Address = *AddressOrErr;
         if (Address == UnknownAddress)
           continue;
         Address -= SectionAddr;
         if (Address >= SectSize)
           continue;
 
-        StringRef Name;
-        if (error(Symbol.getName(Name)))
+        ErrorOr<StringRef> Name = Symbol.getName();
+        if (error(Name.getError()))
           break;
-        Symbols.push_back(std::make_pair(Address, Name));
+        Symbols.push_back(std::make_pair(Address, *Name));
       }
     }
 
@@ -1109,19 +1113,23 @@ void llvm::PrintSymbolTable(const ObjectFile *o) {
     return;
   }
   for (const SymbolRef &Symbol : o->symbols()) {
-    uint64_t Address;
+    ErrorOr<uint64_t> AddressOrError = Symbol.getAddress();
+    if (error(AddressOrError.getError()))
+      continue;
+    uint64_t Address = *AddressOrError;
     SymbolRef::Type Type = Symbol.getType();
     uint32_t Flags = Symbol.getFlags();
     section_iterator Section = o->section_end();
-    if (error(Symbol.getAddress(Address)))
-      continue;
     if (error(Symbol.getSection(Section)))
       continue;
     StringRef Name;
     if (Type == SymbolRef::ST_Debug && Section != o->section_end()) {
       Section->getName(Name);
-    } else if (error(Symbol.getName(Name))) {
-      continue;
+    } else {
+      ErrorOr<StringRef> NameOrErr = Symbol.getName();
+      if (error(NameOrErr.getError()))
+        continue;
+      Name = *NameOrErr;
     }
 
     bool Global = Flags & SymbolRef::SF_Global;

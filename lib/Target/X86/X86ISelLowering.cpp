@@ -1611,6 +1611,7 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
   setTargetDAGCombine(ISD::SIGN_EXTEND);
   setTargetDAGCombine(ISD::SIGN_EXTEND_INREG);
   setTargetDAGCombine(ISD::SINT_TO_FP);
+  setTargetDAGCombine(ISD::UINT_TO_FP);
   setTargetDAGCombine(ISD::SETCC);
   setTargetDAGCombine(ISD::INTRINSIC_WO_CHAIN);
   setTargetDAGCombine(ISD::BUILD_VECTOR);
@@ -14995,6 +14996,54 @@ static SDValue getScalarMaskingNode(SDValue Op, SDValue Mask,
     return DAG.getNode(X86ISD::SELECT, dl, VT, IMask, Op, PreservedSrc);
 }
 
+/// When the 32-bit MSVC runtime transfers control to us, either to an outlined
+/// function or when returning to a parent frame after catching an exception, we
+/// recover the parent frame pointer by doing arithmetic on the incoming EBP.
+/// Here's the math:
+///   RegNodeBase = EntryEBP - RegNodeSize
+///   ParentFP = RegNodeBase - RegNodeFrameOffset
+/// Subtracting RegNodeSize takes us to the offset of the registration node, and
+/// subtracting the offset (negative on x86) takes us back to the parent FP.
+static SDValue recoverFramePointer(SelectionDAG &DAG, const Function *Fn,
+                                   SDValue EntryEBP) {
+  MachineFunction &MF = DAG.getMachineFunction();
+  SDLoc dl;
+
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+  MVT PtrVT = TLI.getPointerTy();
+
+  // It's possible that the parent function no longer has a personality function
+  // if the exceptional code was optimized away, in which case we just return
+  // the incoming EBP.
+  if (!Fn->hasPersonalityFn())
+    return EntryEBP;
+
+  // The RegNodeSize is 6 32-bit words for SEH and 4 for C++ EH. See
+  // WinEHStatePass for the full struct definition.
+  int RegNodeSize;
+  switch (classifyEHPersonality(Fn->getPersonalityFn())) {
+  default:
+    report_fatal_error("can only recover FP for MSVC EH personality functions");
+  case EHPersonality::MSVC_X86SEH: RegNodeSize = 24; break;
+  case EHPersonality::MSVC_CXX: RegNodeSize = 16; break;
+  }
+
+  // Get an MCSymbol that will ultimately resolve to the frame offset of the EH
+  // registration.
+  MCSymbol *OffsetSym =
+      MF.getMMI().getContext().getOrCreateParentFrameOffsetSymbol(
+          GlobalValue::getRealLinkageName(Fn->getName()));
+  SDValue OffsetSymVal = DAG.getMCSymbol(OffsetSym, PtrVT);
+  SDValue RegNodeFrameOffset =
+      DAG.getNode(ISD::FRAME_ALLOC_RECOVER, dl, PtrVT, OffsetSymVal);
+
+  // RegNodeBase = EntryEBP - RegNodeSize
+  // ParentFP = RegNodeBase - RegNodeFrameOffset
+  SDValue RegNodeBase = DAG.getNode(ISD::SUB, dl, PtrVT, EntryEBP,
+                                    DAG.getConstant(RegNodeSize, dl, PtrVT));
+  return DAG.getNode(ISD::SUB, dl, PtrVT, RegNodeBase, RegNodeFrameOffset);
+}
+
 static SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, const X86Subtarget *Subtarget,
                                        SelectionDAG &DAG) {
   SDLoc dl(Op);
@@ -15440,6 +15489,17 @@ static SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, const X86Subtarget *Subtarget
     SDValue Result = DAG.getMCSymbol(LSDASym, VT);
     return DAG.getNode(X86ISD::Wrapper, dl, VT, Result);
   }
+
+  case Intrinsic::x86_seh_recoverfp: {
+    SDValue FnOp = Op.getOperand(1);
+    SDValue IncomingFPOp = Op.getOperand(2);
+    GlobalAddressSDNode *GSD = dyn_cast<GlobalAddressSDNode>(FnOp);
+    auto *Fn = dyn_cast_or_null<Function>(GSD ? GSD->getGlobal() : nullptr);
+    if (!Fn)
+      report_fatal_error(
+          "llvm.x86.seh.recoverfp must take a function as the first argument");
+    return recoverFramePointer(DAG, Fn, IncomingFPOp);
+  }
   }
 }
 
@@ -15650,35 +15710,38 @@ static SDValue LowerREADCYCLECOUNTER(SDValue Op, const X86Subtarget *Subtarget,
   return DAG.getMergeValues(Results, DL);
 }
 
-static SDValue LowerEXCEPTIONINFO(SDValue Op, const X86Subtarget *Subtarget,
-                                  SelectionDAG &DAG) {
+static SDValue LowerSEHRESTOREFRAME(SDValue Op, const X86Subtarget *Subtarget,
+                                    SelectionDAG &DAG) {
   MachineFunction &MF = DAG.getMachineFunction();
   SDLoc dl(Op);
-  SDValue FnOp = Op.getOperand(2);
-  SDValue FPOp = Op.getOperand(3);
+  SDValue Chain = Op.getOperand(0);
 
-  // Compute the symbol for the parent EH registration. We know it'll get
-  // emitted later.
-  auto *Fn = cast<Function>(cast<GlobalAddressSDNode>(FnOp)->getGlobal());
-  MCSymbol *ParentFrameSym =
-      MF.getMMI().getContext().getOrCreateParentFrameOffsetSymbol(
-          GlobalValue::getRealLinkageName(Fn->getName()));
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+  MVT VT = TLI.getPointerTy();
 
-  // Create a TargetExternalSymbol for the label to avoid any target lowering
-  // that would make this PC relative.
-  MVT PtrVT = Op.getSimpleValueType();
-  SDValue OffsetSym = DAG.getMCSymbol(ParentFrameSym, PtrVT);
-  SDValue OffsetVal =
-      DAG.getNode(ISD::FRAME_ALLOC_RECOVER, dl, PtrVT, OffsetSym);
+  const X86RegisterInfo *RegInfo = Subtarget->getRegisterInfo();
+  unsigned FrameReg =
+      RegInfo->getPtrSizedFrameRegister(DAG.getMachineFunction());
+  unsigned SPReg = RegInfo->getStackRegister();
 
-  // Add the offset to the FP.
-  SDValue Add = DAG.getNode(ISD::ADD, dl, PtrVT, FPOp, OffsetVal);
+  // Get incoming EBP.
+  SDValue IncomingEBP =
+      DAG.getCopyFromReg(Chain, dl, FrameReg, VT);
 
-  // Load the second field of the struct, which is 4 bytes in. See
-  // WinEHStatePass for more info.
-  Add = DAG.getNode(ISD::ADD, dl, PtrVT, Add, DAG.getConstant(4, dl, PtrVT));
-  return DAG.getLoad(PtrVT, dl, DAG.getEntryNode(), Add, MachinePointerInfo(),
-                     false, false, false, 0);
+  // Load [EBP-24] into SP.
+  SDValue SPAddr =
+      DAG.getNode(ISD::ADD, dl, VT, IncomingEBP, DAG.getConstant(-24, dl, VT));
+  SDValue NewSP =
+      DAG.getLoad(VT, dl, Chain, SPAddr, MachinePointerInfo(), false, false,
+                  false, VT.getScalarSizeInBits() / 8);
+  Chain = DAG.getCopyToReg(Chain, dl, SPReg, NewSP);
+
+  // FIXME: Restore the base pointer in case of stack realignment!
+
+  // Adjust EBP to point back to the original frame position.
+  SDValue NewFP = recoverFramePointer(DAG, MF.getFunction(), IncomingEBP);
+  Chain = DAG.getCopyToReg(Chain, dl, FrameReg, NewFP);
+  return Chain;
 }
 
 static SDValue LowerINTRINSIC_W_CHAIN(SDValue Op, const X86Subtarget *Subtarget,
@@ -15687,8 +15750,8 @@ static SDValue LowerINTRINSIC_W_CHAIN(SDValue Op, const X86Subtarget *Subtarget,
 
   const IntrinsicData* IntrData = getIntrinsicWithChain(IntNo);
   if (!IntrData) {
-    if (IntNo == Intrinsic::x86_seh_exceptioninfo)
-      return LowerEXCEPTIONINFO(Op, Subtarget, DAG);
+    if (IntNo == llvm::Intrinsic::x86_seh_restoreframe)
+      return LowerSEHRESTOREFRAME(Op, Subtarget, DAG);
     return SDValue();
   }
 
@@ -24171,23 +24234,37 @@ static SDValue PerformSExtCombine(SDNode *N, SelectionDAG &DAG,
     return SDValue();
   }
 
-  if (VT.isVector()) {
-    auto ExtendToVec128 = [&DAG](SDLoc DL, SDValue N) {
+  if (VT.isVector() && Subtarget->hasSSE2()) {
+    auto ExtendVecSize = [&DAG](SDLoc DL, SDValue N, unsigned Size) {
       EVT InVT = N.getValueType();
       EVT OutVT = EVT::getVectorVT(*DAG.getContext(), InVT.getScalarType(),
-                                   128 / InVT.getScalarSizeInBits());
-      SmallVector<SDValue, 8> Opnds(128 / InVT.getSizeInBits(),
+                                   Size / InVT.getScalarSizeInBits());
+      SmallVector<SDValue, 8> Opnds(Size / InVT.getSizeInBits(),
                                     DAG.getUNDEF(InVT));
       Opnds[0] = N;
       return DAG.getNode(ISD::CONCAT_VECTORS, DL, OutVT, Opnds);
     };
+
+    // If target-size is less than 128-bits, extend to a type that would extend
+    // to 128 bits, extend that and extract the original target vector.
+    if (VT.getSizeInBits() < 128 && !(128 % VT.getSizeInBits()) &&
+        (SVT == MVT::i64 || SVT == MVT::i32 || SVT == MVT::i16) &&
+        (InSVT == MVT::i32 || InSVT == MVT::i16 || InSVT == MVT::i8)) {
+      unsigned Scale = 128 / VT.getSizeInBits();
+      EVT ExVT =
+          EVT::getVectorVT(*DAG.getContext(), SVT, 128 / SVT.getSizeInBits());
+      SDValue Ex = ExtendVecSize(DL, N0, Scale * InVT.getSizeInBits());
+      SDValue SExt = DAG.getNode(ISD::SIGN_EXTEND, DL, ExVT, Ex);
+      return DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, VT, SExt,
+                         DAG.getIntPtrConstant(0, DL));
+    }
 
     // If target-size is 128-bits, then convert to ISD::SIGN_EXTEND_VECTOR_INREG
     // which ensures lowering to X86ISD::VSEXT (pmovsx*).
     if (VT.getSizeInBits() == 128 &&
         (SVT == MVT::i64 || SVT == MVT::i32 || SVT == MVT::i16) &&
         (InSVT == MVT::i32 || InSVT == MVT::i16 || InSVT == MVT::i8)) {
-      SDValue ExOp = ExtendToVec128(DL, N0);
+      SDValue ExOp = ExtendVecSize(DL, N0, 128);
       return DAG.getSignExtendVectorInReg(ExOp, DL, VT);
     }
 
@@ -24206,7 +24283,7 @@ static SDValue PerformSExtCombine(SDNode *N, SelectionDAG &DAG,
            ++i, Offset += NumSubElts) {
         SDValue SrcVec = DAG.getNode(ISD::EXTRACT_SUBVECTOR, DL, InSubVT, N0,
                                      DAG.getIntPtrConstant(Offset, DL));
-        SrcVec = ExtendToVec128(DL, SrcVec);
+        SrcVec = ExtendVecSize(DL, SrcVec, 128);
         SrcVec = DAG.getSignExtendVectorInReg(SrcVec, DL, SubVT);
         Opnds.push_back(SrcVec);
       }
@@ -24583,6 +24660,31 @@ static SDValue performVectorCompareAndMaskUnaryOpCombine(SDNode *N,
   return SDValue();
 }
 
+static SDValue PerformUINT_TO_FPCombine(SDNode *N, SelectionDAG &DAG,
+                                        const X86Subtarget *Subtarget) {
+  SDValue Op0 = N->getOperand(0);
+  EVT VT = N->getValueType(0);
+  EVT InVT = Op0.getValueType();
+  EVT InSVT = InVT.getScalarType();
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+
+  // UINT_TO_FP(vXi8) -> SINT_TO_FP(ZEXT(vXi8 to vXi32))
+  // UINT_TO_FP(vXi16) -> SINT_TO_FP(ZEXT(vXi16 to vXi32))
+  if (InVT.isVector() && (InSVT == MVT::i8 || InSVT == MVT::i16)) {
+    SDLoc dl(N);
+    EVT DstVT = EVT::getVectorVT(*DAG.getContext(), MVT::i32,
+                                 InVT.getVectorNumElements());
+    SDValue P = DAG.getNode(ISD::ZERO_EXTEND, dl, DstVT, Op0);
+
+    if (TLI.isOperationLegal(ISD::UINT_TO_FP, DstVT))
+      return DAG.getNode(ISD::UINT_TO_FP, dl, VT, P);
+
+    return DAG.getNode(ISD::SINT_TO_FP, dl, VT, P);
+  }
+
+  return SDValue();
+}
+
 static SDValue PerformSINT_TO_FPCombine(SDNode *N, SelectionDAG &DAG,
                                         const X86Subtarget *Subtarget) {
   // First try to optimize away the conversion entirely when it's
@@ -24592,16 +24694,18 @@ static SDValue PerformSINT_TO_FPCombine(SDNode *N, SelectionDAG &DAG,
 
   // Now move on to more general possibilities.
   SDValue Op0 = N->getOperand(0);
-  EVT InVT = Op0->getValueType(0);
+  EVT VT = N->getValueType(0);
+  EVT InVT = Op0.getValueType();
+  EVT InSVT = InVT.getScalarType();
 
   // SINT_TO_FP(vXi8) -> SINT_TO_FP(SEXT(vXi8 to vXi32))
   // SINT_TO_FP(vXi16) -> SINT_TO_FP(SEXT(vXi16 to vXi32))
-  if (InVT == MVT::v8i8 || InVT == MVT::v4i8 ||
-      InVT == MVT::v8i16 || InVT == MVT::v4i16) {
+  if (InVT.isVector() && (InSVT == MVT::i8 || InSVT == MVT::i16)) {
     SDLoc dl(N);
-    MVT DstVT = MVT::getVectorVT(MVT::i32, InVT.getVectorNumElements());
+    EVT DstVT = EVT::getVectorVT(*DAG.getContext(), MVT::i32,
+                                 InVT.getVectorNumElements());
     SDValue P = DAG.getNode(ISD::SIGN_EXTEND, dl, DstVT, Op0);
-    return DAG.getNode(ISD::SINT_TO_FP, dl, N->getValueType(0), P);
+    return DAG.getNode(ISD::SINT_TO_FP, dl, VT, P);
   }
 
   // Transform (SINT_TO_FP (i64 ...)) into an x87 operation if we have
@@ -24611,10 +24715,10 @@ static SDValue PerformSINT_TO_FPCombine(SDNode *N, SelectionDAG &DAG,
     EVT LdVT = Ld->getValueType(0);
 
     // This transformation is not supported if the result type is f16
-    if (N->getValueType(0) == MVT::f16)
+    if (VT == MVT::f16)
       return SDValue();
 
-    if (!Ld->isVolatile() && !N->getValueType(0).isVector() &&
+    if (!Ld->isVolatile() && !VT.isVector() &&
         ISD::isNON_EXTLoad(Op0.getNode()) && Op0.hasOneUse() &&
         !Subtarget->is64Bit() && LdVT == MVT::i64) {
       SDValue FILDChain = Subtarget->getTargetLowering()->BuildFILD(
@@ -24835,6 +24939,7 @@ SDValue X86TargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::STORE:          return PerformSTORECombine(N, DAG, Subtarget);
   case ISD::MSTORE:         return PerformMSTORECombine(N, DAG, Subtarget);
   case ISD::SINT_TO_FP:     return PerformSINT_TO_FPCombine(N, DAG, Subtarget);
+  case ISD::UINT_TO_FP:     return PerformUINT_TO_FPCombine(N, DAG, Subtarget);
   case ISD::FADD:           return PerformFADDCombine(N, DAG, Subtarget);
   case ISD::FSUB:           return PerformFSUBCombine(N, DAG, Subtarget);
   case X86ISD::FXOR:

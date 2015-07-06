@@ -647,10 +647,8 @@ public:
   }
 protected:
   void moveSymbolNext(DataRefImpl &Symb) const override;
-  std::error_code getSymbolName(DataRefImpl Symb,
-                                StringRef &Res) const override;
-  std::error_code getSymbolAddress(DataRefImpl Symb,
-                                   uint64_t &Res) const override;
+  ErrorOr<StringRef> getSymbolName(DataRefImpl Symb) const override;
+  ErrorOr<uint64_t> getSymbolAddress(DataRefImpl Symb) const override;
   uint64_t getSymbolValue(DataRefImpl Symb) const override;
   uint64_t getCommonSymbolSizeImpl(DataRefImpl Symb) const override;
   uint32_t getSymbolFlags(DataRefImpl Symb) const override;
@@ -669,13 +667,11 @@ protected:
   bool isSectionData(DataRefImpl Sec) const override;
   bool isSectionBSS(DataRefImpl Sec) const override;
   bool isSectionVirtual(DataRefImpl Sec) const override;
-  bool sectionContainsSymbol(DataRefImpl Sec, DataRefImpl Symb) const override;
   relocation_iterator section_rel_begin(DataRefImpl Sec) const override;
   relocation_iterator section_rel_end(DataRefImpl Sec) const override;
 
   void moveRelocationNext(DataRefImpl &Rel) const override;
-  std::error_code getRelocationAddress(DataRefImpl Rel,
-                                       uint64_t &Res) const override;
+  ErrorOr<uint64_t> getRelocationAddress(DataRefImpl Rel) const override;
   uint64_t getRelocationOffset(DataRefImpl Rel) const override;
   symbol_iterator getRelocationSymbol(DataRefImpl Rel) const override;
   uint64_t getRelocationType(DataRefImpl Rel) const override;
