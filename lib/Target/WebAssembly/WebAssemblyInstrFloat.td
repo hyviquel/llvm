@@ -12,26 +12,34 @@
 ///
 //===----------------------------------------------------------------------===//
 
+defm FADD : BinaryFP<fadd>;
+defm FSUB : BinaryFP<fsub>;
+defm FMUL : BinaryFP<fmul>;
+defm FDIV : BinaryFP<fdiv>;
+defm FABS : UnaryFP<fabs>;
+defm FNEG : UnaryFP<fneg>;
+defm COPYSIGN : BinaryFP<fcopysign>;
+
+/*
+ * TODO(jfb): add and test these:
+ * defm CEIL : UnaryFP<fceil>;
+ * defm FLOOR : UnaryFP<ffloor>;
+ * defm TRUNC : UnaryFP<ftrunc>;
+ * defm NEARESTINT : UnaryFP<fnearbyint>;
+ */
+
+defm EQ : ComparisonFP<SETOEQ>;
+defm NE : ComparisonFP<SETUNE>;
+defm LT : ComparisonFP<SETOLT>;
+defm LE : ComparisonFP<SETOLE>;
+defm GT : ComparisonFP<SETOGT>;
+defm GE : ComparisonFP<SETOGE>;
+
+defm SQRT : UnaryFP<fsqrt>;
+
 /*
  * TODO(jfb): Add the following for 32-bit and 64-bit.
  *
- * float32.add: addition
- * float32.sub: subtraction
- * float32.mul: multiplication
- * float32.div: division
- * float32.abs: absolute value
- * float32.neg: negation
- * float32.copysign: copysign
- * float32.ceil: ceiling operation
- * float32.floor: floor operation
- * float32.trunc: round to nearest integer towards zero
- * float32.nearestint: round to nearest integer, ties to even
- * float32.eq: compare equal
- * float32.lt: less than
- * float32.le: less than or equal
- * float32.gt: greater than
- * float32.ge: greater than or equal
- * float32.sqrt: square root
  * float32.min: minimum (binary operator); if either operand is NaN, returns NaN
  * float32.max: maximum (binary operator); if either operand is NaN, returns NaN
  */

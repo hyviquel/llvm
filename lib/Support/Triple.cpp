@@ -197,6 +197,7 @@ const char *Triple::getEnvironmentTypeName(EnvironmentType Kind) {
   case Itanium: return "itanium";
   case Cygnus: return "cygnus";
   case Spark: return "spark";
+  case AMDOpenCL: return "amdopencl";
   }
 
   llvm_unreachable("Invalid EnvironmentType!");
@@ -436,6 +437,7 @@ static Triple::EnvironmentType parseEnvironment(StringRef EnvironmentName) {
     .StartsWith("itanium", Triple::Itanium)
     .StartsWith("cygnus", Triple::Cygnus)
     .StartsWith("spark", Triple::Spark)
+    .StartsWith("amdopencl", Triple::AMDOpenCL)
     .Default(Triple::UnknownEnvironment);
 }
 
