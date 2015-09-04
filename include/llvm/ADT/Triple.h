@@ -124,7 +124,8 @@ public:
     MipsTechnologies,
     NVIDIA,
     CSR,
-    LastVendorType = CSR
+    Myriad,
+    LastVendorType = Myriad
   };
   enum OSType {
     UnknownOS,
@@ -172,7 +173,8 @@ public:
     Itanium,
     Cygnus,
     AMDOpenCL,
-    LastEnvironmentType = AMDOpenCL
+    CoreCLR,
+    LastEnvironmentType = CoreCLR
   };
   enum ObjectFormatType {
     UnknownObjectFormat,
@@ -439,6 +441,10 @@ public:
     return getOS() == Triple::Win32 && getEnvironment() == Triple::MSVC;
   }
 
+  bool isWindowsCoreCLREnvironment() const {
+    return getOS() == Triple::Win32 && getEnvironment() == Triple::CoreCLR;
+  }
+
   bool isWindowsItaniumEnvironment() const {
     return getOS() == Triple::Win32 && getEnvironment() == Triple::Itanium;
   }
@@ -596,7 +602,7 @@ public:
   ///
   /// \param Arch the architecture name (e.g., "armv7s"). If it is an empty
   /// string then the triple's arch name is used.
-  const char* getARMCPUForArch(StringRef Arch = StringRef()) const;
+  StringRef getARMCPUForArch(StringRef Arch = StringRef()) const;
 
   /// @}
   /// @name Static helpers for IDs.
